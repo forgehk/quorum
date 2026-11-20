@@ -12,6 +12,36 @@ So the Raft node here owns no goroutines, clocks or sockets. Every input is an e
 
 No dependencies outside the Go standard library.
 
+**Status:** a study implementation. The node is the algorithm and nothing else: it has no network transport and no on-disk log, and the simulator is its only host. It is not a substitute for a production Raft library.
+
+```text
+                 one seed
+                    │
+   ┌────────────────▼─────────────────────────────────────────┐
+   │ simulator: one goroutine, one random source, no clocks    │
+   │                                                           │
+   │   clients ──▶ kv store ──▶ raft node x5 ◀──▶ network      │
+   │      │        sessions     Tick / Step       drop, delay, │
+   │      │                                       partition    │
+   │      │        fault injector: crash, restart,             │
+   │      │        isolate the leader                          │
+   │      ▼                                                    │
+   │   history of every call and return                        │
+   └──────┬────────────────────────────────────────────────────┘
+          ▼
+   linearizability checker ──▶ "no property violated", or the seed that broke it
+```
+
+## Quick start
+
+Needs Go 1.22 or newer and nothing else.
+
+```bash
+go test ./...                                    # 34 tests, about 10 seconds
+go run ./cmd/quorum-sim -seeds 500               # 500 simulated clusters, about 10 seconds
+go run ./cmd/quorum-sim -seed 1337 -seeds 1 -v   # replay one seed, tick by tick
+```
+
 ## What is implemented
 
 | | |
@@ -40,6 +70,10 @@ At the end of every run, after the network is healed and every node restarted:
 - **Convergence.** Every node holds a byte-identical store.
 - **Linearizability.** The history the clients observed (calls, returns, results) can be explained by one sequential order of their operations that respects real time. Checked per key with the Wing and Gong search and Lowe's memoization.
 
+The first two and linearizability are safety properties: they must hold at every moment, whatever the network does. Liveness is weaker than its name. Raft cannot promise progress while the network keeps failing, and nothing here claims it does. The check is that the cluster recovers once the faults stop.
+
+The checker's assumptions: each key's history is judged on its own, each client has one operation in flight at a time, and every operation has returned by the time the history is checked.
+
 The fault injector partitions the cluster at random, isolates the current leader, crashes nodes (never more than a minority at once) and restarts them. Messages are delayed by a random number of ticks, which reorders them, and are dropped and duplicated at configurable rates. Clients retry timed-out commands against other nodes, which is what exercises the exactly-once path.
 
 ```console
@@ -48,6 +82,8 @@ $ go run ./cmd/quorum-sim -seeds 1500
 91317 snapshots, 6014 crashes, 15189 partitions, 38790922 messages (6527499 lost)
 no property violated
 ```
+
+Those are seeds 0 through 1499 on Go 1.24 and two cores of a 2.1 GHz Xeon. A run is a function of its seed, so the counts above repeat exactly on any machine; only the time changes.
 
 ## Does the checker actually catch bugs?
 
@@ -60,6 +96,16 @@ $ go run ./cmd/quorum-sim -seeds 40 -unsafe-reads
 seed 17: VIOLATION at tick 4013: linearizability: no sequential order explains the history of key "k1"
 seed 21: VIOLATION at tick 4005: linearizability: no sequential order explains the history of key "k1"
 seed 26: VIOLATION at tick 4009: linearizability: no sequential order explains the history of key "k2"
+```
+
+Any failing seed replays on its own:
+
+```console
+$ go run ./cmd/quorum-sim -seed 17 -seeds 1 -unsafe-reads
+seed 17: VIOLATION at tick 4013: linearizability: no sequential order explains the history of key "k1"
+1 seeds in 19ms: 4013 ticks, 725 operations (725 completed), 9 leader terms, 496 entries committed,
+46 snapshots, 6 crashes, 11 partitions, 19664 messages (3708 lost)
+1 seed(s) violated a property
 ```
 
 **Votes without the up-to-date check.** With that one condition removed from vote granting, a node with a stale log can win an election and overwrite committed entries. The simulator reports it as a state machine safety violation, though rarely: one seed in 300 on a three node cluster.
